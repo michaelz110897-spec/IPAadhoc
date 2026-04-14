@@ -1,0 +1,5 @@
+# Session artifacts must never be committed -- they contain Google auth cookies.
+*.har
+session/
+__pycache__/
+*.pyc
