@@ -1,81 +1,109 @@
 ---
 name: notebooklm-mobile
-description: Push sources (URLs, text, files) to Google NotebookLM and produce mobile deep links or Shortcut/intent recipes that open the notebook on iOS/Android. Use when the user wants to hand content from this session off to NotebookLM on their phone, create or populate a notebook from conversation context, or generate a Shortcut/Android intent for NotebookLM ingestion. Android is the primary target; iOS is also supported.
+description: Read from and act on Google NotebookLM through the user's Google account, and produce mobile deep links / Shortcut / Android intent recipes that hand off to the NotebookLM app. Use when the user wants to list or manage NotebookLM notebooks and sources from the terminal, chat with a notebook, add URL / text / PDF sources, create or delete notebooks, or open a notebook on their phone. Android is the primary mobile target; iOS is also supported.
 ---
 
-# NotebookLM Mobile Integration
+# NotebookLM Integration (desktop + mobile)
 
-NotebookLM has **no public API**. This skill integrates with it via three layered approaches, from most to least stable:
+NotebookLM has **no public API and no OAuth scope**. This skill integrates via four layered approaches, from most stable to least:
 
-1. **Mobile deep links** (stable). `https://notebooklm.google.com/notebook/{id}` is a Universal Link on iOS and an App Link on Android. Tapping it opens the NotebookLM app directly on the given notebook.
-2. **Share-target intents** (stable). The NotebookLM mobile apps register as share receivers for `text/plain` and `application/pdf`. From Claude (desktop) we emit ready-to-run `am start` commands for ADB, and `shortcuts://` URLs for iOS. From the phone, the user taps and the app opens pre-filled.
-3. **Unofficial scripted API** (fragile). NotebookLM's web app uses Google's `batchexecute` RPC. RPC IDs change periodically, so this skill does not hardcode them. Instead, `scripts/nlm_client.py` replays **HAR-captured** requests against the user's session. See `references/auth_setup.md` to capture your own.
+1. **Mobile deep links** (stable). `https://notebooklm.google.com/notebook/{id}` is a Universal Link on iOS and an App Link on Android. Pure URL formatting, no auth.
+2. **Share-target intents** (stable). NotebookLM's mobile apps register as share receivers. We emit ADB `am start` commands and `intent://` URIs for Android, and Shortcut-compatible URLs for iOS.
+3. **Browser automation** (preferred for "act on my account" use cases). `scripts/nlm_browser.py` drives a real Chromium using a persistent profile at `~/.notebooklm/chrome-profile/`. One interactive login; headless after that. Supports full CRUD + chat.
+4. **Unofficial scripted API / HAR replay** (lightest, most fragile). `scripts/nlm_client.py` replays HAR-captured batchexecute requests. Useful when the UI breaks or when a browser is unavailable.
 
 ## When to use this skill
 
-Invoke this skill when the user asks to:
+Invoke when the user asks to:
 
-- "Send this to NotebookLM" / "Add this to my notebook"
+- "List / read my notebooks / sources"
+- "Add this to my NotebookLM" / "Create a notebook with these sources"
+- "Ask my notebook X about Y" (chat query)
+- "Delete this source / notebook"
 - "Open NotebookLM on my phone at notebook X"
-- "Make a Shortcut for NotebookLM"
-- "Push these URLs into a new NotebookLM notebook"
+- "Make a Shortcut / intent for NotebookLM"
 
-If the user only wants to *summarize* content (no handoff to NotebookLM), do not invoke this skill.
+If the user only wants to *summarize* content without touching their NotebookLM account, do not invoke.
 
 ## Workflow
 
-Pick the branch that matches what the user needs. Do not run every script.
+Pick the branch that matches the user's ask. Do not run every script.
 
-### Branch A — User has a phone in hand, wants a tap-to-open link
+### Branch A — Mobile tap-to-open link
 
-1. Ask which notebook (URL or ID). If they don't have one, offer to create one (Branch C).
-2. Run `python scripts/deeplink.py --notebook <id> [--query "..."]`. Output is a short URL.
-3. Paste the URL. On iOS it opens via Universal Link; on Android via App Link. Include both the `https://` form and the Android `intent://` form — some launchers need the intent form to force the app.
+1. Get the notebook id (from a URL they paste, or Branch E's `list-notebooks`).
+2. `python scripts/deeplink.py notebook --notebook <id>` → https:// Universal/App Link.
+3. `python scripts/android_intent.py --mode uri open-notebook --notebook <id>` → intent:// URI for Android launchers that don't auto-route.
 
-### Branch B — User wants a reusable Shortcut / intent recipe
+### Branch B — Reusable Shortcut / intent recipe
 
-1. Read `assets/android_intent_recipes.md` for ADB `am start` patterns and `intent://` URIs. Emit the specific command for their content.
-2. For iOS, read `assets/ios_shortcut_recipe.md` and guide the user through building the one-time Shortcut. After it exists, emit `shortcuts://run-shortcut?name=...&input=...` URLs.
-3. The package name is `com.google.android.apps.labs.language.tailwind` — this is hardcoded in the recipes. If the user reports "app not found," have them confirm via `adb shell pm list packages | grep tailwind` — Google has renamed the package before.
+1. Android: consult `assets/android_intent_recipes.md` and emit the specific `adb shell am start ...` or `intent://` URL.
+2. iOS: walk through `assets/ios_shortcut_recipe.md` once; afterward emit `shortcuts://run-shortcut?name=...&input=...` URLs.
+3. Android package is `com.google.android.apps.labs.language.tailwind`. Verify with `adb shell pm list packages | grep tailwind` if it fails.
 
-### Branch C — User wants to upload sources via script (desktop)
+### Branch C — Read/act on the user's NotebookLM account (PREFERRED)
 
-1. Confirm the user has completed `references/auth_setup.md` (captured a HAR while logged in). If not, walk them through it.
-2. Use `scripts/nlm_client.py` with their HAR file and content:
-   ```
-   python scripts/nlm_client.py add-source \
-     --har ~/.notebooklm/session.har \
-     --notebook <id> \
-     --url https://example.com/article
-   ```
-3. After upload, emit the mobile deep link (Branch A) so they can open the notebook on their phone.
-4. If the HAR-replay fails with a 4xx, the RPC signature has drifted. Tell the user to recapture the HAR — do **not** guess at the new parameters.
+Use `scripts/nlm_browser.py` (Playwright). First run requires interactive login:
 
-### Branch D — User wants to create a new notebook from scratch
+```
+python scripts/nlm_browser.py login     # one time, visible
+```
 
-1. Gather the sources (URLs, pasted text, file paths). Summarize what will be ingested before acting.
-2. Create the notebook via `scripts/nlm_client.py create-notebook --har ... --title "..."`. This returns a notebook ID.
-3. Add each source (loop Branch C step 2).
-4. Emit the mobile deep link.
+Then headless operation for everything else:
+
+| Operation | Command |
+| --- | --- |
+| List notebooks | `nlm_browser.py list-notebooks` |
+| List sources in a notebook | `nlm_browser.py list-sources --notebook <id>` |
+| Add URL source | `nlm_browser.py add-url --notebook <id> --url <url>` |
+| Add text source | `nlm_browser.py add-text --notebook <id> --text "..."` |
+| Add PDF source | `nlm_browser.py add-pdf --notebook <id> --path ./file.pdf` |
+| Create notebook | `nlm_browser.py create-notebook --title "..."` |
+| Delete source | `nlm_browser.py delete-source --notebook <id> --title "..." --confirm` |
+| Delete notebook | `nlm_browser.py delete-notebook --notebook <id> --confirm` |
+| Chat with notebook | `nlm_browser.py chat --notebook <id> --question "..."` |
+| Mobile handoff | `nlm_browser.py open-on-phone --notebook <id>` |
+
+Pass `--visible` before any subcommand to watch the browser. Destructive operations (delete-*) require `--confirm`.
+
+If a command hangs or returns empty, run `nlm_browser.py --visible check-ui --screenshot` — this probes each selector and writes screenshots to `~/.notebooklm/debug/`. Update `scripts/nlm_selectors.py` per `references/selectors.md` if probes fail.
+
+### Branch D — Scripted API fallback (HAR replay)
+
+Use when the browser path is unavailable (no Chromium) or a UI bug blocks browser automation:
+
+1. Walk the user through `references/auth_setup.md` to capture a HAR.
+2. `python scripts/nlm_client.py inspect --marker <unique>` then `replay --sub <needle>=<value>`.
+3. If HAR replay fails with 4xx, recapture the HAR — do **not** guess RPC IDs.
+
+### Branch E — User wants mobile handoff after desktop action
+
+Chain: Branch C creates/populates a notebook → capture the returned id → Branch A emits the tap link. `open-on-phone` does this in one step.
 
 ## Invariants
 
-- **Never** store session cookies in the repo. The HAR file lives in `~/.notebooklm/` (gitignored by this skill's own `.gitignore`).
-- **Never** fabricate RPC IDs or endpoint paths. If a script fails, surface the HTTP response and ask the user to recapture.
-- **Never** run `scripts/nlm_client.py` without confirming the user authorized the action — it mutates their NotebookLM account.
-- Deep-link builders (`deeplink.py`, `android_intent.py`) are pure string formatters with no network calls — safe to run freely.
-- When emitting Android ADB commands, quote `--es` extras carefully; URLs with `&` break unquoted `am start` commands.
+- **No OAuth exists for NotebookLM.** Do not claim or attempt to build one.
+- **Never** commit anything under `~/.notebooklm/`. `.gitignore` already excludes it, but re-check when adding new artifacts.
+- **Always** require `--confirm` for destructive operations (delete-source, delete-notebook). Before invoking them, echo back the target title/id to the user and wait for explicit yes.
+- **Never** fabricate RPC IDs or CSS classes. When the browser driver fails, direct the user to `check-ui` and the selector playbook rather than guessing.
+- Deep-link builders are pure string formatters with no network calls — safe to run freely.
+- The dedicated Chrome profile has full access to the signed-in Google account. Never copy, archive, or transmit the profile directory.
+- When emitting Android ADB commands, rely on `android_intent.py`'s shell-quoting; don't hand-format `--es` extras.
 
 ## File map
 
 | Path | Purpose | Read when |
 | --- | --- | --- |
-| `scripts/deeplink.py` | Build `https://notebooklm.google.com/...` URLs | Branch A |
-| `scripts/android_intent.py` | Build `intent://` URIs and `am start` commands | Branch B (Android) |
-| `scripts/nlm_client.py` | HAR-replay client for create-notebook / add-source | Branch C, D |
-| `assets/ios_shortcut_recipe.md` | Step-by-step iOS Shortcut build | Branch B (iOS) |
-| `assets/android_intent_recipes.md` | Share-intent patterns for Android | Branch B (Android) |
-| `references/auth_setup.md` | How to capture a NotebookLM session HAR | Branch C, D (first run only) |
-| `references/endpoints.md` | Known batchexecute RPC surface, with caveats | When scripted API breaks |
+| `scripts/deeplink.py` | Build mobile deep-link URLs | Branch A |
+| `scripts/android_intent.py` | Build `intent://` URIs + `am start` commands | Branch B (Android) |
+| `scripts/nlm_browser.py` | Playwright CRUD + chat driver | **Branch C (primary)** |
+| `scripts/nlm_selectors.py` | Centralized UI selector map | When check-ui reports failures |
+| `scripts/nlm_client.py` | HAR-replay fallback | Branch D |
+| `assets/ios_shortcut_recipe.md` | iOS Shortcut build steps | Branch B (iOS) |
+| `assets/android_intent_recipes.md` | Android intent patterns | Branch B (Android) |
+| `references/playwright_setup.md` | Install + first-run login | Branch C (first time) |
+| `references/selectors.md` | Playbook for updating selectors | When browser UI breaks |
+| `references/auth_setup.md` | HAR capture instructions | Branch D (first time) |
+| `references/endpoints.md` | batchexecute RPC surface notes | When HAR replay breaks |
 
-Load reference files only when the branch you're on requires them.
+Load reference files only when the branch requires them.

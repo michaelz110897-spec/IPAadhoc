@@ -1,5 +1,7 @@
 # Session artifacts must never be committed -- they contain Google auth cookies.
 *.har
 session/
+chrome-profile/
+debug/
 __pycache__/
 *.pyc
